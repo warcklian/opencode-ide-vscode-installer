@@ -15,6 +15,10 @@
 !uninstall.sh
 !update-toolkit.ps1
 !version.json
+!README.md
+!LICENSE
+!MANUAL.md
+!MANUAL.es.md
 
 !lib/
 !lib/**
