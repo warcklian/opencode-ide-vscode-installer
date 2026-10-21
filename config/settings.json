@@ -1,0 +1,22 @@
+{
+  "$comment": "OpenCode portable installer configuration. Empty fields use the system default.",
+  "channel": "latest",
+  "pinnedVersion": "",
+  "installDir": "",
+  "cacheDir": "",
+  "sources": {
+    "$comment": "Resolution URLs. They contain NO version numbers: the latest is discovered live.",
+    "updateApi": "https://opencode.ai/update/api/latest/cli/npm",
+    "npmRegistry": "https://registry.npmjs.org",
+    "scope": "@opencode",
+    "legacyScope": "@opencode-ai",
+    "githubLatest": "https://api.github.com/repos/anomalyco/opencode/releases/latest"
+  },
+  "selfUpdate": {
+    "$comment": "Self-update of THIS folder. Enable it once the repository exists on GitHub.",
+    "enabled": false,
+    "manifestUrl": "",
+    "repo": "",
+    "ref": "main"
+  }
+}

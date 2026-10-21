@@ -1,0 +1,22 @@
+# Allowlist: only the files required to install are versioned.
+# Everything else in this folder stays on disk and is not uploaded.
+
+*
+!.gitignore
+
+!install.ps1
+!install.cmd
+!install.sh
+!update.ps1
+!update.cmd
+!update.sh
+!uninstall.ps1
+!uninstall.cmd
+!uninstall.sh
+!update-toolkit.ps1
+!version.json
+
+!lib/
+!lib/**
+!config/
+!config/settings.json

@@ -1,0 +1,7 @@
+{
+  "name": "opencode-ide-vscode-installer",
+  "version": "1.2.0",
+  "description": "Portable, adaptive, self-updating installer for the OpenCode CLI (Windows/macOS/Linux)",
+  "repository": "",
+  "license": "MIT"
+}
