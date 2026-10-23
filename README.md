@@ -95,6 +95,25 @@ Quick taste:
 | `Ctrl+Alt+K`          | Which-key: discover every keybind                   |
 | `opencode run "..."`  | Non-interactive one-shot prompt                     |
 
+### Local Ollama models
+
+If [Ollama](https://ollama.com) is installed, **`install` registers it
+automatically** (provider block in `~/.config/opencode/opencode.json`). Skip
+with `-NoOllama` / `--no-ollama`. You can also run setup alone anytime:
+
+```bash
+# pull at least one model so the picker is not empty
+ollama pull qwen2.5-coder:7b
+
+# optional manual re-sync
+.\setup-ollama.cmd      # Windows
+./setup-ollama.sh       # macOS / Linux
+```
+
+Then `opencode` → **`Ctrl+X` then `M`** → pick `ollama/...`. Details:
+[MANUAL.md](MANUAL.md#local-ollama-models) /
+[MANUAL.es.md](MANUAL.es.md#modelos-locales-de-ollama).
+
 ---
 
 ## Adaptive behavior

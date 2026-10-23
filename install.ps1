@@ -41,6 +41,9 @@
 .PARAMETER Yes
     Assume "yes" to prompts (non-interactive). Adds to PATH without asking.
 
+.PARAMETER NoOllama
+    Skip automatic Ollama provider setup even if Ollama is detected.
+
 .PARAMETER Force
     Reinstall even if the version already matches.
 
@@ -71,6 +74,7 @@ param(
     [switch]$Offline,
     [switch]$NoPath,
     [switch]$Yes,
+    [switch]$NoOllama,
     [ValidateSet('tar', 'built-in')][string]$Method,
     [switch]$Json,
     [switch]$Quiet,
@@ -98,11 +102,51 @@ function Show-OcHelp {
     Write-Host '  -Offline         Use only the local cache.'
     Write-Host '  -NoPath          Do not touch the PATH.'
     Write-Host '  -Yes             Assume yes to prompts (non-interactive).'
+    Write-Host '  -NoOllama        Skip auto Ollama provider setup.'
     Write-Host '  -Force           Reinstall.'
     Write-Host '  -Method <m>      Force extraction: tar | built-in.'
     Write-Host '  -Json            JSON output.'
     Write-Host '  -Quiet           Minimal output.'
     Write-Host ''
+}
+
+function Invoke-OcAutoOllamaSetup {
+    param($SystemInfo, [hashtable]$Settings)
+    if ($NoOllama) { return $null }
+    if (-not $SystemInfo -or -not $SystemInfo.Ollama) { return $null }
+    $o = $SystemInfo.Ollama
+    if (-not ($o.Found -or $o.Reachable)) { return $null }
+
+    $log = { param($m) }
+    if (-not $Quiet -and -not $Json) {
+        $log = { param($m) Write-OcMessage ("  " + $m) 'dim' }
+        Write-OcMessage '  Ollama detected: registering local models for Ctrl+X M ...' 'info'
+    }
+    try {
+        # If the binary exists but the API is down, still register the endpoint.
+        $writeAnyway = [bool]($o.Found -and -not $o.Reachable)
+        $r = Install-OcOllamaIntegration -Settings $Settings -TimeoutSec 5 `
+            -WriteEvenIfUnreachable:$writeAnyway -Log $log
+        if (-not $Json -and -not $Quiet) {
+            if ($r.ok -and $r.written) {
+                Write-OcMessage ("  Ollama provider written: {0} ({1} model(s))" -f $r.configPath, $r.modelCount) 'ok'
+                if ($r.modelCount -eq 0) {
+                    Write-OcMessage '  No Ollama models pulled yet. Example: ollama pull qwen2.5-coder:7b' 'warn'
+                }
+            } elseif ($r.ok) {
+                Write-OcMessage '  Ollama provider already configured (nothing new to write).' 'ok'
+            } else {
+                Write-OcMessage ("  Ollama auto-setup skipped: {0}" -f $r.error) 'warn'
+                Write-OcMessage '  You can retry later with: .\setup-ollama.cmd' 'dim'
+            }
+        }
+        return $r
+    } catch {
+        if (-not $Json -and -not $Quiet) {
+            Write-OcMessage ("  Ollama auto-setup failed (OpenCode install is OK): {0}" -f $_.Exception.Message) 'warn'
+        }
+        return $null
+    }
 }
 
 function Write-OcResult {
@@ -229,11 +273,13 @@ if (-not $shouldInstall) {
             Write-OcMessage ("  Already up to date ({0}). Not reinstalling." -f $installed) 'ok'
         }
     }
+    $ollamaSetup = Invoke-OcAutoOllamaSetup -SystemInfo $info -Settings $settings
     Write-OcResult ([pscustomobject]@{
             ok = $true; action = 'up-to-date'; installed = $installed; previous = $installed; available = $latest
             target = $plan.Platform.Target; package = $plan.Package.Name; source = $plan.Source
             installDir = $dir; cacheDir = $cache; pathAdded = $pathAdded; pathWasPresent = $info.PathContainsInstallDir; updated = $false
             externalInstall = $info.ExternalInstall; externalPath = $info.PathBinary; externalVersion = $info.PathVersion
+            ollamaSetup = $ollamaSetup
         })
     exit 0
 }
@@ -275,6 +321,8 @@ if (-not $Json -and -not $Quiet) {
     Write-OcMessage '  Done. Open the Cursor integrated terminal and run: opencode' 'info'
 }
 
+$ollamaSetup = Invoke-OcAutoOllamaSetup -SystemInfo $info -Settings $settings
+
 Write-OcResult ([pscustomobject]@{
         ok = $true; action = $action; installed = $newVersion; previous = $installed; available = $latest
         target = $plan.Platform.Target; package = $plan.Package.Name
@@ -282,5 +330,6 @@ Write-OcResult ([pscustomobject]@{
         extractMethod = $installResult.Method; installDir = $dir; cacheDir = $cache
         pathAdded = $pathAdded; pathWasPresent = $pathWasPresent; updated = $true
         externalInstall = $info.ExternalInstall; externalPath = $info.PathBinary; externalVersion = $info.PathVersion
+        ollamaSetup = $ollamaSetup
     })
 exit 0

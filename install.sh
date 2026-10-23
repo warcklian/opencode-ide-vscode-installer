@@ -18,6 +18,7 @@
 #   --offline           Use only the local cache.
 #   --no-path           Do not modify the PATH.
 #   --yes               Assume yes to prompts (non-interactive).
+#   --no-ollama         Skip auto Ollama provider setup.
 #   --force             Reinstall.
 #   --json              JSON output (non-interactive).
 #   --quiet             Minimal output.
@@ -54,9 +55,10 @@ VERSION_REQUESTED=""
 INSTALL_DIR="${HOME}/.opencode/bin"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/${TOOLKIT_NAME}"
 CHECK=false; UPDATE=false; DRY_RUN=false; OFFLINE=false
-NOPATH=false; YES=false; FORCE=false; JSON=false; QUIET=false
+NOPATH=false; YES=false; NO_OLLAMA=false; FORCE=false; JSON=false; QUIET=false
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
 log() { [ "$JSON" = true ] && return 0; [ "$QUIET" = true ] && return 0; "$@"; }
 
 while [ $# -gt 0 ]; do
@@ -70,6 +72,7 @@ while [ $# -gt 0 ]; do
     --offline)     OFFLINE=true; shift ;;
     --no-path)     NOPATH=true; shift ;;
     --yes|-y)      YES=true; shift ;;
+    --no-ollama)   NO_OLLAMA=true; shift ;;
     --force)       FORCE=true; shift ;;
     --json)        JSON=true; shift ;;
     --quiet)       QUIET=true; shift ;;
@@ -126,7 +129,7 @@ print_system_report() {
   log title "System check"
   log dim "  Platform            : $OS / $(uname -m)  -> target $TARGET"
   local t
-  for t in tar curl git node npm bun pnpm yarn; do
+  for t in tar curl git node npm bun pnpm yarn ollama; do
     if have "$t"; then log dim "  $(printf '%-19s' "$t") : $(tool_path "$t")"
     else log dim "  $(printf '%-19s' "$t") : (not found)"; fi
   done
@@ -372,10 +375,39 @@ if [ -n "$PATH_OPENCODE" ] && [ "$PATH_OPENCODE" != "$INSTALL_DIR/$APP" ]; then
 fi
 if [ "$EXTERNAL_CURRENT" = true ] && [ -z "${installed:-}" ]; then SHOULD_INSTALL=false; fi
 
+auto_ollama_setup() {
+  [ "$NO_OLLAMA" = true ] && return 0
+  [ "$DRY_RUN" = true ] && return 0
+  [ "$CHECK" = true ] && return 0
+  local setup="$SCRIPT_DIR/setup-ollama.sh"
+  [ -f "$setup" ] || return 0
+  local found=false
+  if have ollama; then found=true; fi
+  for c in /usr/local/bin/ollama /usr/bin/ollama /opt/homebrew/bin/ollama \
+           "$HOME/.local/bin/ollama" "$HOME/bin/ollama"; do
+    [ -x "$c" ] && found=true
+  done
+  # Also try a quick API probe (Ollama running without being on PATH).
+  if [ "$found" = false ]; then
+    if curl -fsS --max-time 2 "http://127.0.0.1:11434/api/tags" >/dev/null 2>&1; then
+      found=true
+    fi
+  fi
+  [ "$found" = true ] || return 0
+  log info "  Ollama detected: registering local models for Ctrl+X M ..."
+  if [ "$JSON" = true ] || [ "$QUIET" = true ]; then
+    bash "$setup" --quiet --write-even-if-unreachable >/dev/null 2>&1 || \
+      log warn "  Ollama auto-setup failed (OpenCode install is OK). Retry: ./setup-ollama.sh"
+  else
+    bash "$setup" --write-even-if-unreachable || \
+      warn "  Ollama auto-setup failed (OpenCode install is OK). Retry: ./setup-ollama.sh"
+  fi
+}
+
 if [ "$SHOULD_INSTALL" = false ]; then
   ACTION="up-to-date"
   NEW_VERSION="$installed"
-  if [ "$JSON" = true ]; then emit_json
+  if [ "$JSON" = true ]; then :
   elif [ "$QUIET" = false ]; then
     if [ "$EXTERNAL_CURRENT" = true ]; then ok "  OpenCode is already installed at $PATH_OPENCODE (v$PATH_OPENCODE_VERSION). Nothing to do."
     else ok "  Already up to date ($installed). Not reinstalling."; fi
@@ -384,6 +416,8 @@ if [ "$SHOULD_INSTALL" = false ]; then
   if [ -x "$INSTALL_DIR/$APP" ]; then
     case ":$PATH:" in *":$INSTALL_DIR:"*) : ;; *) add_to_path ;; esac
   fi
+  auto_ollama_setup
+  [ "$JSON" = true ] && emit_json
   exit 0
 fi
 
@@ -401,5 +435,6 @@ if [ "$QUIET" = false ]; then
   [ -n "${NEW_VERSION:-}" ] && ok "  Verified: opencode $NEW_VERSION"
   info '  Done. Open the Cursor integrated terminal and run: opencode'
 fi
+auto_ollama_setup
 [ "$JSON" = true ] && emit_json
 exit 0

@@ -18,5 +18,10 @@
     "manifestUrl": "",
     "repo": "",
     "ref": "main"
+  },
+  "ollama": {
+    "$comment": "OpenCode provider endpoint for local Ollama. Include /v1; OpenCode derives /api/tags from it.",
+    "baseURL": "http://127.0.0.1:11434/v1",
+    "setDefault": false
   }
 }

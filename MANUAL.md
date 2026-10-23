@@ -199,6 +199,45 @@ config does not rewrite an existing session's model.
 - List every available model from the CLI: `opencode models`
 - Model selector syntax: `provider/model` or `provider/model#variant`
 
+### Local Ollama models
+
+OpenCode can use models you already pulled into [Ollama](https://ollama.com).
+This toolkit adds a helper that registers the Ollama endpoint in your OpenCode
+config so those models appear in **`Ctrl+X` then `M`** (and in `opencode models`).
+
+1. Install and start Ollama, then pull at least one model:
+
+```bash
+ollama pull qwen2.5-coder:7b
+ollama list
+```
+
+2. Register Ollama with OpenCode. **`install` does this automatically** when
+   Ollama is detected. To run it alone (or re-sync after pulling new models):
+
+```bash
+# Windows
+.\setup-ollama.cmd
+
+# macOS / Linux
+./setup-ollama.sh
+```
+
+Skip auto-setup during install with `-NoOllama` / `--no-ollama`. Optional setup
+flags: `-SetDefault` / `--set-default`, `-BaseURL` / `--base-url`,
+`-DryRun` / `--dry-run`.
+
+3. Run `opencode`, press **`Ctrl+X` then `M`**, and select an `ollama/...` entry.
+   You can also type `/models` or run `opencode models` outside the TUI.
+
+OpenCode v2 also probes `http://127.0.0.1:11434` automatically when Ollama is
+running. The setup script still helps by writing a durable `providers.ollama`
+block (custom URL and explicit model map) into
+`~/.config/opencode/opencode.json` without wiping your other settings.
+
+If the picker stays empty: confirm `ollama list` shows models, the Ollama app /
+`ollama serve` is running, then re-run `setup-ollama`.
+
 ---
 
 ## Agents / modes (Build, Plan, ...)

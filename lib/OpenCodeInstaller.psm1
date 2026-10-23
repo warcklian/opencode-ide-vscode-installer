@@ -47,6 +47,12 @@ $script:DefaultSettings = @{
     repo        = ''
     ref         = 'main'
   }
+  ollama        = @{
+    # OpenAI-compatible base URL (must end with /v1). OpenCode derives /api/tags from it.
+    baseURL     = 'http://127.0.0.1:11434/v1'
+    # When true, setup-ollama may set model to the first discovered Ollama model.
+    setDefault  = $false
+  }
 }
 
 # --- Internal helpers --------------------------------------------------------
@@ -766,8 +772,12 @@ function Get-OcSystemInfo {
   $cache = Get-OcCacheDir -Settings $Settings -Override $CacheDir
 
   $tools = [ordered]@{}
-  foreach ($name in @('tar', 'curl', 'git', 'node', 'npm', 'bun', 'pnpm', 'yarn')) {
+  foreach ($name in @('tar', 'curl', 'git', 'node', 'npm', 'bun', 'pnpm', 'yarn', 'ollama')) {
     $tools[$name] = Get-OcCommandPath $name
+  }
+  if (-not $tools['ollama']) {
+    $ollamaBin = Get-OcOllamaBinary
+    if ($ollamaBin) { $tools['ollama'] = $ollamaBin }
   }
 
   $managedExe = Join-Path $dir (Get-OcBinaryName -OS $platform.OS)
@@ -787,6 +797,9 @@ function Get-OcSystemInfo {
     if (-not $sameDir) { $externalInstall = $true }
   }
 
+  $ollamaInfo = $null
+  try { $ollamaInfo = Get-OcOllamaInfo -Settings $Settings -TimeoutSec 2 } catch { $ollamaInfo = $null }
+
   return [pscustomobject]@{
     OS                    = $platform.OS
     Arch                  = $platform.Arch
@@ -805,6 +818,7 @@ function Get-OcSystemInfo {
     PathVersion           = $pathVersion
     ExternalInstall       = $externalInstall
     PathContainsInstallDir = (Test-OcPathContains -Dir $dir)
+    Ollama                = $ollamaInfo
   }
 }
 
@@ -827,6 +841,19 @@ function Format-OcSystemInfo {
   else { $lines.Add('  OpenCode (on PATH)  : not found') }
   $lines.Add(("  Install dir on PATH : {0}" -f $Info.PathContainsInstallDir))
   $lines.Add(("  Install dir         : {0}" -f $Info.InstallDir))
+  if ($Info.PSObject.Properties.Name -contains 'Ollama' -and $Info.Ollama) {
+    $o = $Info.Ollama
+    if ($o.Found) {
+      $lines.Add(("  Ollama binary       : {0}" -f $o.Binary))
+    } else {
+      $lines.Add('  Ollama binary       : not found')
+    }
+    if ($o.Reachable) {
+      $lines.Add(("  Ollama API          : ok ({0} model(s))" -f $o.ModelCount))
+    } elseif ($o.Found -or $o.Error) {
+      $lines.Add(("  Ollama API          : unreachable ({0})" -f $o.Error))
+    }
+  }
   return $lines.ToArray()
 }
 
@@ -927,6 +954,304 @@ function Remove-OcInstall {
   return $removed
 }
 
+# --- Ollama integration (OpenCode provider / model picker) -------------------
+
+function Get-OcOpenCodeConfigDir {
+  if ($env:XDG_CONFIG_HOME) { return (Join-Path $env:XDG_CONFIG_HOME 'opencode') }
+  if ((Get-OcOS) -eq 'windows') {
+    return (Join-Path $env:USERPROFILE '.config\opencode')
+  }
+  return (Join-Path $HOME '.config/opencode')
+}
+
+function Get-OcOpenCodeConfigPath {
+  param([string]$Override)
+  if ($Override) { return $Override }
+  if ($env:OPENCODE_CONFIG -and (Test-Path $env:OPENCODE_CONFIG)) { return $env:OPENCODE_CONFIG }
+  return (Join-Path (Get-OcOpenCodeConfigDir) 'opencode.json')
+}
+
+function Get-OcOllamaBinary {
+  $cmd = Get-OcCommandPath 'ollama'
+  if ($cmd) { return $cmd }
+  $candidates = @()
+  if ((Get-OcOS) -eq 'windows') {
+    if ($env:LOCALAPPDATA) {
+      $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
+    }
+    if ($env:ProgramFiles) {
+      $candidates += (Join-Path $env:ProgramFiles 'Ollama\ollama.exe')
+    }
+  } else {
+    $candidates += @('/usr/local/bin/ollama', '/usr/bin/ollama', '/opt/homebrew/bin/ollama')
+    if ($HOME) {
+      $candidates += (Join-Path $HOME '.local/bin/ollama')
+      $candidates += (Join-Path $HOME 'bin/ollama')
+    }
+  }
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) { return $c }
+  }
+  return $null
+}
+
+function Resolve-OcOllamaEndpoints {
+  param(
+    [string]$BaseURL,
+    [hashtable]$Settings
+  )
+  $raw = $BaseURL
+  if (-not $raw -and $env:OPENCODE_OLLAMA_BASE_URL) { $raw = $env:OPENCODE_OLLAMA_BASE_URL }
+  if (-not $raw -and $Settings -and $Settings.ollama -and $Settings.ollama.baseURL) {
+    $raw = "$($Settings.ollama.baseURL)"
+  }
+  if (-not $raw -and $env:OLLAMA_HOST) { $raw = "$($env:OLLAMA_HOST)" }
+  if (-not $raw) { $raw = 'http://127.0.0.1:11434/v1' }
+
+  $raw = $raw.Trim().TrimEnd('/')
+  if ($raw -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+    $raw = 'http://' + $raw
+  }
+  $openAi = $raw
+  if ($openAi -notmatch '/v1$') { $openAi = $openAi + '/v1' }
+  $apiRoot = $openAi -replace '/v1$', ''
+  return [pscustomobject]@{
+    OpenAiBaseURL = $openAi
+    ApiRoot       = $apiRoot
+    TagsURL       = ($apiRoot + '/api/tags')
+  }
+}
+
+function Get-OcOllamaModels {
+  param(
+    [string]$BaseURL,
+    [hashtable]$Settings,
+    [int]$TimeoutSec = 5
+  )
+  $ep = Resolve-OcOllamaEndpoints -BaseURL $BaseURL -Settings $Settings
+  $content = $null
+  try {
+    # Single attempt: Ollama may be absent; do not burn install time on retries.
+    $content = Invoke-OcRequest -Uri $ep.TagsURL -TimeoutSec $TimeoutSec -Retries 1
+  } catch {
+    return [pscustomobject]@{
+      Ok       = $false
+      Error    = $_.Exception.Message
+      Models   = @()
+      Endpoint = $ep
+    }
+  }
+  $names = New-Object System.Collections.Generic.List[string]
+  try {
+    $doc = $content | ConvertFrom-Json
+    if ($doc.models) {
+      foreach ($m in @($doc.models)) {
+        $n = $null
+        if ($m.name) { $n = "$($m.name)" }
+        elseif ($m.model) { $n = "$($m.model)" }
+        if ($n) { $names.Add($n) }
+      }
+    }
+  } catch {
+    return [pscustomobject]@{
+      Ok       = $false
+      Error    = ("Failed to parse Ollama /api/tags: {0}" -f $_.Exception.Message)
+      Models   = @()
+      Endpoint = $ep
+    }
+  }
+  return [pscustomobject]@{
+    Ok       = $true
+    Error    = $null
+    Models   = @($names.ToArray())
+    Endpoint = $ep
+  }
+}
+
+function Get-OcOllamaInfo {
+  param(
+    [string]$BaseURL,
+    [hashtable]$Settings,
+    [int]$TimeoutSec = 3
+  )
+  $binary = Get-OcOllamaBinary
+  $probe = Get-OcOllamaModels -BaseURL $BaseURL -Settings $Settings -TimeoutSec $TimeoutSec
+  return [pscustomobject]@{
+    Binary     = $binary
+    Found      = [bool]$binary
+    Reachable  = [bool]$probe.Ok
+    Error      = $probe.Error
+    Models     = $probe.Models
+    ModelCount = @($probe.Models).Count
+    Endpoint   = $probe.Endpoint
+  }
+}
+
+function Read-OcJsonFile {
+  param([Parameter(Mandatory)][string]$Path)
+  if (-not (Test-Path $Path)) { return @{} }
+  $raw = Get-Content -Raw -Path $Path -ErrorAction Stop
+  if (-not $raw -or -not $raw.Trim()) { return @{} }
+  return (ConvertTo-OcHashtable ($raw | ConvertFrom-Json))
+}
+
+function Write-OcJsonFile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)]$Object
+  )
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path $dir)) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  }
+  $json = $Object | ConvertTo-Json -Depth 30
+  # UTF-8 without BOM for cross-tool config files.
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($Path, ($json + [Environment]::NewLine), $utf8)
+}
+
+function Merge-OcOllamaProviderConfig {
+  param(
+    [Parameter(Mandatory)][hashtable]$Config,
+    [Parameter(Mandatory)][string]$OpenAiBaseURL,
+    [string[]]$ModelNames = @(),
+    [switch]$SetDefault,
+    [string]$DefaultModel
+  )
+  $out = ConvertTo-OcHashtable $Config
+  if (-not $out) { $out = @{} }
+  if (-not $out.ContainsKey('$schema')) {
+    $out['$schema'] = 'https://opencode.ai/config.json'
+  }
+
+  if (-not $out.ContainsKey('providers') -or $null -eq $out['providers']) {
+    $out['providers'] = @{}
+  } elseif ($out['providers'] -isnot [System.Collections.IDictionary]) {
+    $out['providers'] = @{}
+  }
+  $providers = $out['providers']
+  if (-not $providers.ContainsKey('ollama') -or $null -eq $providers['ollama']) {
+    $providers['ollama'] = @{}
+  } elseif ($providers['ollama'] -isnot [System.Collections.IDictionary]) {
+    $providers['ollama'] = @{}
+  }
+  $ollama = $providers['ollama']
+  if (-not $ollama.ContainsKey('settings') -or $null -eq $ollama['settings']) {
+    $ollama['settings'] = @{}
+  } elseif ($ollama['settings'] -isnot [System.Collections.IDictionary]) {
+    $ollama['settings'] = @{}
+  }
+  $ollama['settings']['baseURL'] = $OpenAiBaseURL
+  if (-not $ollama.ContainsKey('name') -or -not $ollama['name']) {
+    $ollama['name'] = 'Ollama (local)'
+  }
+
+  if (-not $ollama.ContainsKey('models') -or $null -eq $ollama['models'] -or ($ollama['models'] -isnot [System.Collections.IDictionary])) {
+    $ollama['models'] = @{}
+  }
+  $models = $ollama['models']
+  foreach ($name in @($ModelNames)) {
+    if (-not $name) { continue }
+    if (-not $models.ContainsKey($name) -or $null -eq $models[$name] -or ($models[$name] -isnot [System.Collections.IDictionary])) {
+      $models[$name] = @{ name = $name }
+    } else {
+      if (-not $models[$name].ContainsKey('name') -or -not $models[$name]['name']) {
+        $models[$name]['name'] = $name
+      }
+    }
+  }
+
+  # Prefer OpenCode v2 "providers" only. Drop a leftover singular
+  # provider.ollama (from older setup runs) so the picker does not duplicate.
+  if ($out.ContainsKey('provider') -and ($out['provider'] -is [System.Collections.IDictionary])) {
+    if ($out['provider'].ContainsKey('ollama')) { $out['provider'].Remove('ollama') }
+    if ($out['provider'].Count -eq 0) { [void]$out.Remove('provider') }
+  }
+
+  if ($SetDefault) {
+    $pick = $DefaultModel
+    if (-not $pick -and $ModelNames -and $ModelNames.Count -gt 0) { $pick = $ModelNames[0] }
+    if ($pick) { $out['model'] = ('ollama/' + $pick) }
+  }
+
+  return $out
+}
+
+function Install-OcOllamaIntegration {
+  param(
+    [hashtable]$Settings,
+    [string]$BaseURL,
+    [string]$ConfigPath,
+    [switch]$SetDefault,
+    [string]$DefaultModel,
+    [switch]$DryRun,
+    [switch]$WriteEvenIfUnreachable,
+    [int]$TimeoutSec = 5,
+    [scriptblock]$Log
+  )
+  if (-not $Settings) { $Settings = ConvertTo-OcHashtable $script:DefaultSettings }
+  $wantDefault = [bool]$SetDefault
+  if (-not $wantDefault -and $Settings.ollama -and $Settings.ollama.setDefault) {
+    $wantDefault = [bool]$Settings.ollama.setDefault
+  }
+
+  $binary = Get-OcOllamaBinary
+  $probe = Get-OcOllamaModels -BaseURL $BaseURL -Settings $Settings -TimeoutSec $TimeoutSec
+  $ep = $probe.Endpoint
+  $cfgPath = Get-OcOpenCodeConfigPath -Override $ConfigPath
+
+  $result = [ordered]@{
+    ok            = $false
+    binary        = $binary
+    reachable     = [bool]$probe.Ok
+    error         = $probe.Error
+    models        = @($probe.Models)
+    modelCount    = @($probe.Models).Count
+    openAiBaseURL = $ep.OpenAiBaseURL
+    tagsURL       = $ep.TagsURL
+    configPath    = $cfgPath
+    written       = $false
+    dryRun        = [bool]$DryRun
+    setDefault    = $wantDefault
+    defaultModel  = $null
+  }
+
+  if (-not $probe.Ok -and -not $WriteEvenIfUnreachable) {
+    Invoke-OcLog $Log ("Ollama API not reachable at {0}: {1}" -f $ep.TagsURL, $probe.Error)
+    return [pscustomobject]$result
+  }
+
+  $existing = @{}
+  if (Test-Path $cfgPath) {
+    try { $existing = Read-OcJsonFile -Path $cfgPath } catch {
+      $result.error = ("Could not read OpenCode config: {0}" -f $_.Exception.Message)
+      Invoke-OcLog $Log $result.error
+      return [pscustomobject]$result
+    }
+  }
+
+  $merged = Merge-OcOllamaProviderConfig -Config $existing -OpenAiBaseURL $ep.OpenAiBaseURL `
+    -ModelNames @($probe.Models) -SetDefault:$wantDefault -DefaultModel $DefaultModel
+  if ($wantDefault -and $merged.model) { $result.defaultModel = "$($merged.model)" }
+
+  if ($DryRun) {
+    $result.ok = $true
+    Invoke-OcLog $Log ("[DryRun] Would write Ollama provider to {0}" -f $cfgPath)
+    return [pscustomobject]$result
+  }
+
+  try {
+    Write-OcJsonFile -Path $cfgPath -Object $merged
+    $result.written = $true
+    $result.ok = $true
+    Invoke-OcLog $Log ("Wrote Ollama provider into {0}" -f $cfgPath)
+  } catch {
+    $result.error = $_.Exception.Message
+    Invoke-OcLog $Log ("Failed to write config: {0}" -f $result.error)
+  }
+  return [pscustomobject]$result
+}
+
 # --- Toolkit self-update -----------------------------------------------------
 
 function Test-OcToolkitUpdate {
@@ -967,4 +1292,8 @@ Export-ModuleMember -Function `
   Expand-OcTarballManaged, Expand-OcTarball, `
   Get-OcInstallDir, Get-OcCacheDir, Get-OcVersionFromExe, Get-OcInstalledVersion, `
   Get-OcSystemInfo, Format-OcSystemInfo, Test-OcPathContains, Add-OcUserPath, `
-  Resolve-OcPathConsent, Install-OcBinary, Remove-OcInstall, Test-OcToolkitUpdate
+  Resolve-OcPathConsent, Install-OcBinary, Remove-OcInstall, Test-OcToolkitUpdate, `
+  Get-OcOpenCodeConfigDir, Get-OcOpenCodeConfigPath, Get-OcOllamaBinary, `
+  Resolve-OcOllamaEndpoints, Get-OcOllamaModels, Get-OcOllamaInfo, `
+  Read-OcJsonFile, Write-OcJsonFile, Merge-OcOllamaProviderConfig, `
+  Install-OcOllamaIntegration
